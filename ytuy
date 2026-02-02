@@ -1,0 +1,319 @@
+import React, { useState, useEffect } from 'react';
+import {
+  Text,
+  TextInput,
+  TouchableOpacity,
+  ScrollView,
+  Alert,
+  Image,
+  View,
+  ActivityIndicator,
+  SafeAreaView
+} from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import { initializeApp } from 'firebase/app';
+import {
+  getFirestore,
+  collection,
+  addDoc,
+  updateDoc,
+  doc,
+  serverTimestamp,
+  onSnapshot
+} from 'firebase/firestore';
+import {
+  getStorage,
+  ref,
+  uploadBytesResumable,
+  getDownloadURL
+} from 'firebase/storage';
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+} from 'firebase/auth';
+
+/* Firebase config */
+const firebaseConfig = {
+  apiKey: "API_KEY_HERE",
+  authDomain: "PROJECT_ID.firebaseapp.com",
+  projectId: "PROJECT_ID",
+  storageBucket: "PROJECT_ID.appspot.com",
+  messagingSenderId: "SENDER_ID",
+  appId: "APP_ID"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const storage = getStorage(app);
+const auth = getAuth(app);
+
+export default function App() {
+  const [mode, setMode] = useState('user'); // user | adminLogin | admin
+  const [adminEmail, setAdminEmail] = useState('');
+  const [adminPassword, setAdminPassword] = useState('');
+  const [applications, setApplications] = useState([]);
+  const [unsubscribe, setUnsubscribe] = useState(null);
+
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [idImage, setIdImage] = useState(null);
+
+  const [loading, setLoading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+
+  /* طلب صلاحية الوصول للصور */
+  useEffect(() => {
+    (async () => {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('مطلوب', 'الصلاحية للوصول للصور مطلوبة');
+      }
+    })();
+  }, []);
+
+  /* ADMIN: جلب الطلبات مع اشتراك حي */
+  const loadApplications = () => {
+    const unsub = onSnapshot(
+      collection(db, 'job_applications'),
+      snapshot => {
+        setApplications(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+      },
+      err => {
+        console.error(err);
+        Alert.alert('خطأ', 'تعذر تحميل الطلبات');
+      }
+    );
+    setUnsubscribe(() => unsub);
+  };
+
+  /* إنشاء حساب إداري افتراضي */
+  const ensureAdminAccount = async () => {
+    try {
+      const methods = await auth.fetchSignInMethodsForEmail('admin@fk.com');
+      if (methods.length === 0) {
+        await createUserWithEmailAndPassword(auth, 'admin@fk.com', 'Admin1234!');
+        console.log('تم إنشاء الحساب الإداري الافتراضي: admin@fk.com / Admin1234!');
+      }
+    } catch (err) {
+      console.error('خطأ في إنشاء الحساب الإداري', err);
+    }
+  };
+
+  useEffect(() => {
+    ensureAdminAccount();
+  }, []);
+
+  const adminLogin = async () => {
+    if (!adminEmail || !adminPassword) {
+      Alert.alert('تنبيه', 'يرجى إدخال البريد وكلمة المرور');
+      return;
+    }
+    setLoading(true);
+    try {
+      await signInWithEmailAndPassword(auth, adminEmail, adminPassword);
+      setMode('admin');
+      loadApplications();
+    } catch (err) {
+      console.error(err);
+      Alert.alert('خطأ', 'البريد أو كلمة المرور غير صحيحة');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const logoutAdmin = () => {
+    if (unsubscribe) unsubscribe();
+    setApplications([]);
+    setMode('user');
+  };
+
+  const acceptUser = async (id) => {
+    setLoading(true);
+    try {
+      await updateDoc(doc(db, 'job_applications', id), {
+        status: 'مقبول',
+        acceptedAt: serverTimestamp()
+      });
+      Alert.alert('تم', 'تم إرسال القبول');
+    } catch (err) {
+      console.error(err);
+      Alert.alert('خطأ', 'تعذر تحديث الحالة');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const pickImage = async () => {
+    try {
+      const res = await ImagePicker.launchImageLibraryAsync({
+        quality: 0.8,
+        allowsEditing: true,
+        mediaTypes: ImagePicker.MediaTypeOptions.Images
+      });
+      const uri = res.assets?.[0]?.uri || res.uri;
+      if (uri) setIdImage(uri);
+    } catch (err) {
+      console.error(err);
+      Alert.alert('خطأ', 'فشل اختيار الصورة');
+    }
+  };
+
+  const removeImage = () => setIdImage(null);
+
+  const validatePhone = (p) => /^\+?\d{7,15}$/.test(p);
+
+  const submit = async () => {
+    if (!name.trim() || !phone.trim() || !idImage) {
+      Alert.alert('تنبيه', 'جميع الحقول مطلوبة');
+      return;
+    }
+    if (!validatePhone(phone.trim())) {
+      Alert.alert('تنبيه', 'الرجاء إدخال رقم هاتف صحيح');
+      return;
+    }
+
+    setLoading(true);
+    setUploadProgress(0);
+
+    try {
+      const resp = await fetch(idImage);
+      const blob = await resp.blob();
+      const filename = `ids/${Date.now()}.jpg`;
+      const imgRef = ref(storage, filename);
+
+      await new Promise((resolve, reject) => {
+        const uploadTask = uploadBytesResumable(imgRef, blob, { contentType: blob.type || 'image/jpeg' });
+        uploadTask.on(
+          'state_changed',
+          snapshot => {
+            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            setUploadProgress(Math.round(progress));
+          },
+          error => reject(error),
+          () => resolve()
+        );
+      });
+
+      const url = await getDownloadURL(imgRef);
+      await addDoc(collection(db, 'job_applications'), {
+        name: name.trim(),
+        phone: phone.trim(),
+        idImage: url,
+        status: 'قيد المراجعة',
+        createdAt: serverTimestamp()
+      });
+
+      Alert.alert('تم', 'تم إرسال الطلب');
+      setName('');
+      setPhone('');
+      setIdImage(null);
+    } catch (err) {
+      console.error(err);
+      Alert.alert('خطأ', 'فشل إرسال الطلب. حاول مرة أخرى.');
+    } finally {
+      setLoading(false);
+      setUploadProgress(0);
+    }
+  };
+
+  /* UI */
+  if (mode === 'adminLogin') {
+    return (
+      <SafeAreaView style={{ flex: 1 }}>
+        <ScrollView style={{ padding: 20 }}>
+          <Text style={{ fontSize: 20, textAlign: 'center' }}>دخول الإدارة</Text>
+
+          <TextInput
+            placeholder="البريد الإلكتروني"
+            value={adminEmail}
+            onChangeText={setAdminEmail}
+            autoCapitalize="none"
+            keyboardType="email-address"
+            style={{ borderWidth: 1, marginTop: 10, padding: 10 }}
+          />
+          <TextInput
+            placeholder="كلمة المرور"
+            secureTextEntry
+            value={adminPassword}
+            onChangeText={setAdminPassword}
+            style={{ borderWidth: 1, marginTop: 10, padding: 10 }}
+          />
+
+          <TouchableOpacity onPress={adminLogin} disabled={loading} style={{ backgroundColor: 'black', padding: 12, marginTop: 10 }}>
+            {loading ? <ActivityIndicator color="#fff" /> : <Text style={{ color: 'white', textAlign: 'center' }}>دخول</Text>}
+          </TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (mode === 'admin') {
+    return (
+      <SafeAreaView style={{ flex: 1 }}>
+        <ScrollView style={{ padding: 20 }}>
+          <Text style={{ fontSize: 20, textAlign: 'center' }}>لوحة الإدارة</Text>
+          {applications.map(a => (
+            <View key={a.id} style={{ backgroundColor: '#fff', padding: 10, marginVertical: 6 }}>
+              <Text>الاسم: {a.name}</Text>
+              <Text>الهاتف: {a.phone}</Text>
+              <Text>الحالة: {a.status}</Text>
+              {a.idImage && <Image source={{ uri: a.idImage }} style={{ height: 150, marginVertical: 5 }} />}
+              <TouchableOpacity onPress={() => acceptUser(a.id)} disabled={loading} style={{ backgroundColor: 'green', padding: 8 }}>
+                <Text style={{ color: 'white', textAlign: 'center' }}>قبول</Text>
+              </TouchableOpacity>
+            </View>
+          ))}
+          <TouchableOpacity onPress={logoutAdmin}>
+            <Text style={{ textAlign: 'center', marginTop: 10 }}>رجوع</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={{ flex: 1 }}>
+      <ScrollView style={{ padding: 20 }}>
+        <Text style={{ fontSize: 20, textAlign: 'center' }}>توظيف – فرسان الخمائل</Text>
+
+        <TextInput
+          placeholder="الاسم"
+          value={name}
+          onChangeText={setName}
+          style={{ borderWidth: 1, padding: 10, marginTop: 10 }}
+        />
+        <TextInput
+          placeholder="رقم الهاتف"
+          value={phone}
+          onChangeText={setPhone}
+          keyboardType="phone-pad"
+          style={{ borderWidth: 1, padding: 10, marginTop: 10 }}
+        />
+
+        <TouchableOpacity onPress={pickImage} style={{ backgroundColor: '#555', padding: 10, marginTop: 10 }}>
+          <Text style={{ color: 'white', textAlign: 'center' }}>رفع الهوية</Text>
+        </TouchableOpacity>
+
+        {idImage && (
+          <View style={{ marginTop: 10 }}>
+            <Image source={{ uri: idImage }} style={{ height: 150 }} />
+            <TouchableOpacity onPress={removeImage} style={{ marginTop: 5, backgroundColor: 'red', padding: 6 }}>
+              <Text style={{ color: 'white', textAlign: 'center' }}>إزالة الصورة</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {uploadProgress > 0 && <Text>تحميل الصورة: {uploadProgress}%</Text>}
+
+        <TouchableOpacity onPress={submit} disabled={loading} style={{ backgroundColor: 'black', padding: 12, marginTop: 10 }}>
+          {loading ? <ActivityIndicator color="#fff" /> : <Text style={{ color: 'white', textAlign: 'center' }}>إرسال الطلب</Text>}
+        </TouchableOpacity>
+
+        <TouchableOpacity onPress={() => setMode('adminLogin')}>
+          <Text style={{ textAlign: 'center', marginTop: 10 }}>دخول الإدارة</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
